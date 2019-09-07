@@ -1,0 +1,513 @@
+###-----------------------------------------------------------------------------------###
+###-----------------------------------------------------------------------------------###
+### REPO DETECTION ALGORITHM
+### Nicholas Garvin 16 Aug 2018. Contact garvinn@rba.gov.au or nick.j.garvin@gmail.com
+###    for enquiries or comments.
+###
+### This code detects repos from securities transactions data. The top-level function
+###    repo.alg.F calls other user-defined functions that perform various roles. Only 
+###    base R is required.
+### The algorithm uses constant interest bounds. If changes in interest bounds are 
+###    desired, separate the transactions dataset into data subsets before and after 
+###    the change, and run the algorithm separately on each subset.
+### The algorithm requires setting/calibrating 'matrix.max' and 'iter.max' parameters.
+###    Iter.max should be set as high as computing or time constraints allow. Matrix.max 
+###    must be >0 and <iter.max. It will likely be bound by computing constraints at 
+###    below iter.max. Calibrate it between 1 and this bound to minimise computing time. 
+###    Higher matrix.max => more work done by matrix method relative to iterative method.
+###    Defaults settings are matrix.max=22 and iter.max=45. If matrix.max is set above
+### To limit algorithm to two-transaction repos (more false omissions, fewer false 
+###    positives, much faster) set no.multtrns=TRUE. 
+### To run placebo tests, set intsprdpos=FALSE.
+
+# The hierarchy of functions that form the algorithm is as follows. The steps in 
+#   parentheses indicate how these functions (roughly) align with the stylised steps in
+#   Section 2.3 of Garvin (2018).
+
+# repo.alg.F(
+#   intraday.F()
+#   ovrlp.2trns.F()               (steps 1.1, 1.2 and 1.3)
+#   det.2trns.F()                 (steps 1.4 and 1.5)
+#   mult.trns.F(                  (steps 2.3, 2.5 and 2.9)
+#     cnddt.vectors.F()           (steps 2.1, 2.2 and 2.4)
+#     reduce.cnd.vector.F()       (step 2.3)
+#     det.mult.F(                 (steps 2.6 and 2.8)
+#       reduce.cnd.vector.F()     (step 2.3)
+#       check.fv.F(               (step 2.7)
+#         check.int.F()           (step 2.7)
+#         iterative.F()           (step 2.7)
+#       )
+#     )
+#   )
+# )
+# 
+###-----------------------------------------------------------------------------------###
+###-----------------------------------------------------------------------------------###
+
+
+### Top-level function
+repo.alg.F <- function(trns, mat.cap, interest.bounds, tr.cap, WD,
+                       matrix.max=22, iter.max=45,
+                       no.intraday=FALSE, no.multtrns=FALSE, intsprdpos=TRUE, 
+                       flnm.pref=NULL) {
+  # Combines each stage of the algorithm and exports all outputs to an Rdata file.
+  #   Returns total run time of repo.alg.F.
+  # The Rdata file contains a list with the following contents. Transactions in repos
+  #   are referred to by their row number in the transactions dataset.
+  # [[1]] intraday repos (list of 2-element vectors)
+  # [[2]] transactions dataset
+  # [[3]] prlctn.2tr (list of 2 matrices)
+  #   [[1]] prlctn.Mu (2col matrix of unique 2tr repos)
+  #   [[2]] prlctn.Mm (2col matrix of nonunique 2tr repos)
+  # [[4]] alloutput 
+  #   [[1]] list of vectors containing multiple-transaction repos
+  #   [[2]] 2col matrix. One row per candidate vector. Col1: length. Col2: 1=mtrx det,
+  #         -1=iter det, 0=no detection.
+  #
+  # Function arguments:
+  # - trns: transactions dataframe the same format as example dataset
+  # - mat.cap: positive integer. Maximum no of days detected repos can be open
+  # - interest.bounds: 2-element numeric vector of lower and upper bounds for detected
+  #     repos' interest rates. e.g. c(0.01, 0.03) is 1 to 3 percentage points
+  # - tr.cap: integer specifying max number of transactions in a detected repo
+  # - matrix.max: positive integer. Maximum candidate-vector length for matrix method
+  # - iter.max: integer > matrix.max. Max candidate-vector length for iterative method
+  # - WD: string scalar. Folder path of where to save output.
+  # - no.intraday: boolean scalar. Turn off intraday repo detections?
+  # - no.multtrns: boolean scalar. Turn off multiple trns repo detections?
+  # - intsprdpos: boolean scalar. FALSE makes interest.bounds negative for placebo tests
+  # - flnm.pref: string scalar. Prefix for filename of exported Rdata file
+  
+  fstart.time <- Sys.time()  # Store the start time to measure overall run time
+  
+  ### THESE PARAMETERS CAN BE CHANGED BY THE USER AT DISCRETION
+  intraday.fee <- 0   # Maximum value for (intraday-repo repayment/principal minus 1)
+  iter.mthd <- TRUE   # FALSE skips the iterative method; only uses the matrix method
+  
+  ### If matrix max is too large, automatically reduce it and iter.max. The following 9
+  ###   lines can be deleted if matrix.max and iter.max are set with confidence.
+  mm.set.F <- function(x) {
+    try.out <- try(as.matrix(expand.grid(rep(list(0:1), x - 1))))
+    if('try-error' %in% class(try.out)) {
+      x - 2
+    } else x
+  }
+  mm1 <- matrix.max
+  while(matrix.max != mm.set.F(matrix.max)) matrix.max <- mm.set.F(matrix.max)
+  invisible(gc())
+  if(mm1 != matrix.max) iter.max <- iter.max - (mm1 - matrix.max)*5
+  
+  ### Some more formatting of arguments
+  if(!intsprdpos) interest.bounds <- -rev(interest.bounds)  # Make negative for placebo
+  int.rng <- 1 + interest.bounds / 365  # Convert to daily rate
+  
+  ### Remove intraday repos
+  if(no.intraday) intraday.repos <- list() else {
+    intraday.repos <- intraday.F(trns, intraday.fee)  # Gives list of 2-element vectors
+  }
+  
+  ### Detect two-transaction repos
+  # List of candidate vecs
+  prs.L <- ovrlp.2trns.F(trns, int.rng, mat.cap, intraday.repos)  
+  prlctn.2tr <- det.2trns.F(prs.L, trns)  # List of 2-element vectors (detected repos)
+  
+  ### Detect multiple transaction repos
+  matched <- unlist(c(intraday.repos, prlctn.2tr))  # Store already matched transactions
+  start.time <- Sys.time()
+  # Run multiple-transaction repo detection function
+  if(no.multtrns) alloutput.mtr <- list() else {
+    alloutput.mtr <- mult.trns.F(trns, matched, iter.mthd, matrix.max, 
+                                  iter.max, mat.cap, tr.cap, int.rng)
+  }
+  run.time <- Sys.time() - start.time
+  
+  ### Combine algorithm outputs and export them   
+  y <- list(intraday.repos, trns, prlctn.2tr, alloutput.mtr)  # Combine outputs
+  flnm <- paste('_algoutput_mat', mat.cap, '_int', interest.bounds[1], '-', 
+                interest.bounds[2], '_trcap', tr.cap, '.Rdata', sep='')  # Filename
+  if(length(flnm.pref > 0)) flnm <- paste(flnm.pref, flnm, sep='')  # Add prefix
+  flnm <- paste0(WD, '/', flnm)
+  save(y, file=flnm)  # Export
+  
+  return(Sys.time() - fstart.time)  # repo.alg.F returns the total time it took to run
+}
+
+intraday.F <- function(trns, intraday.fee) {
+  # Finds intraday repos where repayment is at most fee*Cons more than the loan. Returns
+  #   a list of 2-element vectors, each being an intraday repo.
+  #
+  # Function arguments:
+  # - trns: transactions dataframe the same format as example dataset
+  # - intraday.fee: integer specifying maximum proportion that intraday repo repayment
+  #     can be above loan size (e.g. 0.1 is 10%)
+  
+  # Paste transaction details together in a string to facilitate matching 
+  CPISINFVSD <- with(trns, paste(Snd, Rec, ISIN, FV, floor(ST)))
+  PCISINFVSD <- with(trns, paste(Rec, Snd, ISIN, FV, floor(ST)))
+  N <- nrow(trns)
+  repo <- vector('list', length=N)  # Initialise list length N. 
+  # Loop through potential matches, check considerations against intraday.fee, ensure no 
+  #   transactions are in more than one repo, and store in initialised list
+  for(n in which(CPISINFVSD %in% PCISINFVSD)) {
+    y <- which(CPISINFVSD[n] == PCISINFVSD & trns$Cons >= trns$Cons[n] & 
+                 trns$Cons <= trns$Cons[n]*(1+intraday.fee) & !(1:N %in% unlist(repo)) &
+                 CPISINFVSD[n] != CPISINFVSD)
+    if(length(y) > 0 & !n %in% unlist(repo)) repo[[n]] <- c(n, y[1])
+  }
+  repo[lapply(repo, length) > 0]  # Keep only nonempty list elements.
+}
+
+ovrlp.2trns.F <- function(trns, int.rng, mat.cap, intraday.repos) {
+  # For each transaction, find all others with reversed counterparties, same ISIN and FV,
+  #   positive cash, between next day and mat.cap later, implied interest within bounds.
+  #   Returns list length N. Each element is a vector with transaction n then all
+  #   other transactions that satisfy these criteria pairwise with n (if any).
+  #
+  # Function arguments:
+  # - trns: transactions dataframe the same format as example dataset
+  # - int.rng: 2-element numeric vector. interest.bounds expressed as daily rates.
+  # - mat.cap: positive integer. Maximum no of days detected repos can be open
+  # - intraday.repos: output of intraday.F. List of 2-element integer vectors 
+  #     identifying intraday repos.
+  
+  if(length(intraday.repos) > 0) trns$FV[unlist(intraday.repos)] <- 
+    -1:-length(unlist(intraday.repos))  # Neutralise transactions in intraday repos
+  CPISINFV <- with(trns, paste(Snd, Rec, ISIN, FV))  # String IDs for matching trnsns
+  PCISINFV <- with(trns, paste(Rec, Snd, ISIN, FV))
+  SDs <- floor(trns$ST)  # Store settlement days
+  prs <- vector('list', nrow(trns))  # Initialise list for storing matches
+  for(i in which(CPISINFV %in% PCISINFV)) {  # Loop through trns and find matches
+    y <- which(CPISINFV[i] == PCISINFV & trns$Cons > 0)  
+    y <- y[SDs[y] > SDs[i] & SDs[y] <= SDs[i] + mat.cap]  # Checking maturity
+    r.imp <- trns$Cons[y] / trns$Cons[i]  # Checking implied interest (incl next line)
+    r.bnds <- outer(int.rng, SDs[y] - SDs[i], function(x1, x2) (x1 - 1)*x2 + 1)
+    prs[[i]] <- c(i, y[r.imp >= r.bnds[1, ] & r.imp <= r.bnds[2, ]])  # Store matches
+  }
+  prs[lapply(prs, length) > 1]  # Keep only elements with matches
+}
+
+det.2trns.F <- function(prs, trns) {
+  # From potential matches found by ovrlp.2trns.F, removes overlaps and stores 2-trnsn
+  #   detected repos. Result is a list of two matrices, each with 2 columns. First matrix
+  #   is unique detected repos; second is non-unique.
+  #
+  # Function arguments:
+  # - prs: list length N of numeric vectors. Output of ovrlp.2trns.F. Each vector stores
+  #     all potential 2nd-leg matches for focus transaction n.
+  # - trns: transactions dataframe the same format as example dataset
+  
+  if(length(prs) == 0) return(NULL)  # End det.2trns.F early if nothing found
+  # Convert each prs element to 2-col matrix of each possible repo with focus trnsn. 
+  prs.M <- lapply(prs, function(x) cbind(x[1], x[2:length(x)]))
+  prs.M <- do.call(rbind, prs.M)  # Combine all the matrices into one.
+  # For each row, count each trnsn's appearances elsewhere, and implied maturity
+  fn <- function(x) c(x[1], x[2], sum(c(prs.M) %in% x[1]), sum(c(prs.M) %in% x[2]), 
+                      trns$ST[x[2]] - trns$ST[x[1]])
+  prs.M <- t(apply(prs.M, 1, fn))  # Combine into 5-col matrix
+  prs.Mu <- prs.M[prs.M[, 3] == 1 & prs.M[, 4] == 1, 1:2]  # 2-col matrix of unique pairs
+  prs.M <- prs.M[prs.M[, 3] != 1 | prs.M[, 4] != 1, ]  # Now focus on non-unique pairs
+  prs.M <- prs.M[order(prs.M[, 5]), ]  # Order them by maturity
+  prs.Mn <- matrix(NA, nrow=length(prs.M), ncol=2)  # Intialise a 2-col matrix to fill
+  r <- 1  # Loop through prs.M, storing pairs then removing subsequent overlapping pairs
+  if(nrow(prs.M) > 0) {
+    for(i in 1:nrow(prs.M)) {  
+      if(sum(prs.M[i, ] %in% c(prs.Mn)) == 0) {
+        prs.Mn[r, ] <- prs.M[i, 1:2]
+        r <- r + 1
+      }
+    }
+  }
+  prs.Mn <- prs.Mn[!is.na(prs.Mn[, 1]), ]  # Remove unused rows from initalised matrix
+  list(prs.Mu, prs.Mn)
+}
+
+mult.trns.F <- function(trns, matched, iter.mthd, matrix.max, iter.max, mat.cap, tr.cap, 
+                        int.rng) {
+  # High level function that runs other functions for detecting multiple-transaction 
+  #   repos. Loops from 3 to tr.cap collecting repos of that length. Returns 2-element 
+  #   list. First is list of numeric vectors, each vector containing trnsns in a 
+  #   multiple-transaction repo. Negative numbers indicate trnsn is opposite direction 
+  #   to focus trnsn. Second element is 2-col matrix with stats on candidate vectors. 
+  #   One row per candidate vector. 1st col is length. 2nd col is 1 if it generated a 
+  #   detected repo with matrix method, -1 with iterative method.
+  #
+  # Function arguments:
+  # - trns: transactions dataframe the same format as example dataset
+  # - matched: positive numeric vector of trnsns in already detected repos.
+  # - iter.mthd: boolean scalar. Use the iterative method for long candidate vectors?
+  # - matrix.max: positive integer. Maximum candidate-vector length for matrix method
+  # - iter.max: integer > matrix.max. Max candidate-vector length for iterative method  
+  # - mat.cap: positive integer. Maximum no of days detected repos can be open
+  # - tr.cap: integer specifying max number of transactions in a detected repo
+  # - int.rng: 2-element numeric vector. interest.bounds expressed as daily rates.
+
+  cnds <- cnddt.vectors.F(trns, mat.cap, matched)  # Generate list of candidate vectors
+  mltrepos <- vector('list')  # Initialise list for mult-trnsn detected repos
+  stats <- c()  # Initialise object for storing stats on candidate vectors
+  for(trno in 2:(tr.cap - 1)) {  # Loop through temporary maximum trnsn numbers.
+    time <- Sys.time()  # Time each loop iteration
+    # Remove already matched trnsns from candidate vectors. Remove matched focus trnsns.
+    cnds <- lapply(cnds, function(x) if(x[1] %in% matched) x[1] else x)
+    cnds <- lapply(cnds, function(x) c(x[1], x[-1][!abs(x[-1]) %in% matched]))
+    for(i in which(lapply(cnds, length) > matrix.max + 1)) cnds[[i]] <- 
+      reduce.cnd.vector.F(cnds[[i]], trns)  # Where possible shorten long vectors
+    cnds <- cnds[lapply(cnds, length) > 2]
+    # det.mult.F is the repo detection function. Explained further below.
+    output <- det.mult.F(cnds, trns, iter.mthd, matrix.max, iter.max, trno, int.rng) 
+    if(length(output) > 0) {
+      # Store detected repos and combine stats into a single matrix
+      mltrepos <- c(mltrepos, output[[1]][lapply(output[[1]], length) > 1])
+      stats <- rbind(stats, do.call(rbind, output[[2]]))   
+      # Add newly detected repos to matched vector
+      mnew <- unlist(output[[1]][lapply(output[[1]], length) > 1])
+      if(length(mnew) > 0) matched <- c(matched, abs(mnew))
+    }
+    print(Sys.time() - time)  # Report loop iteration time
+    Sys.sleep(0.01)  # Required for loop iteration timing
+  }
+  list(mltrepos, stats)
+}
+
+cnddt.vectors.F <- function(trns, mat.cap, matched) {
+  # Forms candidate vectors based on criteria that can be checked either pairwise with
+  #   the focus transaction or groupwise across the full vector. Retuns a list of numeric
+  #   vectors. Each contains the focus transaction then the candidate vector, with 
+  #   transactions in the opposite direction to the focus transaction being negative.
+  #
+  # Function arguments:
+  # - trns: transactions dataframe the same format as example dataset
+  # - mat.cap: positive integer. Maximum no of days detected repos can be open
+  # - matched: positive numeric vector of trnsns in already detected repos.
+  
+  # Neutralise trnsns already in detected repos
+  trns[matched, c('Snd', 'Rec')] <- cbind(-(1:length(matched)), 
+                                        -((length(matched)+1):(2*length(matched))))
+  # Create length N vectors of trns characteristics to use in forming candidate vectors. 
+  pos.FVs <- abs(as.numeric(trns$FV))
+  CPI <- with(trns, paste(Snd, Rec, ISIN))
+  PCI <- with(trns, paste(Rec, Snd, ISIN))
+  SDs <- floor(trns$ST)
+  # Function to be run with lapply. Forms a candidate vector from a focus trnsn
+  fn <- function(f.tr, trns, mat.cap) {
+    crct.mts <- 1:nrow(trns) > f.tr & SDs <= SDs[f.tr] + mat.cap
+    r.BV <- CPI == PCI[f.tr] & crct.mts  # Boolean of potential reverse-direction trnsns
+    s.BV <- CPI == CPI[f.tr] & crct.mts  # Boolean of potential same-direction trnsns
+    # Create a boolean scalar checking if posns could have feasible combination  
+    # 1. At least one reverse dirn trnsn and enough of them to repay focus trnsn
+    Bsc <- sum(r.BV) >= 1 & sum(pos.FVs[r.BV]) >= pos.FVs[f.tr]
+    # 2. The smallest reverse dirn trns is not bigger than all same-dirn trnsns
+    if(Bsc) Bsc <- min(pos.FVs[r.BV]) <= pos.FVs[f.tr] + sum(pos.FVs[s.BV])
+    # 3. If only 2 or more reverse-dirn trnsns, smallest 2 aren't bigger than focus trnsn
+    if(Bsc) if(sum(r.BV) > 1 & sum(s.BV) == 0) Bsc <-  # (assumes no 2-trnsn repos left)
+      sum(sort(pos.FVs[r.BV])[1:2]) <= pos.FVs[f.tr]
+    if(Bsc) Bsc <- max(SDs[r.BV]) > SDs[f.tr]  # Removes intraday repos
+    # If there are feasible combinations, store the vector, with reverse-dirn negative.
+    if(Bsc) y <- c(which(s.BV), -which(r.BV)) else y <- NULL
+    c(f.tr, y)
+  }
+  y2 <- lapply(which(trns$Cons > 0), fn, trns, mat.cap)
+  y2 <- y2[lapply(y2, length) > 1]
+}
+
+reduce.cnd.vector.F <- function(cnd.V, trns) {
+  # From the condition that the lender never repays returns more collateral than was 
+  #   provided, eliminates some elements from candidate vectors. E.g. if a reverse dirn
+  #   trnsn has higher FV than the sum of all same dirn trnsns before it, or if a 
+  #   same dirn trnsn has higher FV than all opposite dirn trnsns after it, it's removed.
+  #   Returns a potentially shortened candidate vector.
+  #
+  # Function arguments:
+  # - cnd.V: numeric 'candidate' vector. Tnsns are negative iff in reverse dirn.
+  # - trns: transactions dataframe the same format as example dataset
+  
+  tr.n <- cbind(trns[abs(cnd.V), ], n=cnd.V)  #  Attach trnsns to candidate vector
+  keep <- FALSE  # Initialise object stating which trnsns should not be removed.
+  while(sum(!keep) > 0) {  # Loop through removal process until no more are removed.
+    tr.n <- tr.n[order(tr.n$ST, tr.n$n > 0), ]  # Order by ST; ties favour reverse dirn
+    fv.s <- ifelse(tr.n$n > 0, abs(tr.n$FV), 0)  # (positive) FVs for same dirn trnsns
+    fv.r <- ifelse(tr.n$n < 0, abs(tr.n$FV), 0)  # (positive) FVs for reverse dirn trnsns
+    cum.s <- cumsum(fv.s)  # Cumulative sum for same dirn FVs
+    cum.r <- rev(cumsum(rev(fv.r)))  # Reverse cumulative sum for reverse dirn FVs
+    keep <- fv.r <= cum.s & fv.s <= cum.r  # Criteria in the function description.
+    tr.n <- tr.n[keep, ]  # Eliminate transactions
+    if(!cnd.V[1] %in% tr.n$n | sum(keep) == 0) {  # Break loop if focus trnsn removed ...
+      cnd.V2 <- cnd.V[1]  # ... or no trnsns left, and return vector of only focus trnsn
+      break
+    } else cnd.V2 <- tr.n$n  # New hopefully shorter candidate vector, ordered by ST
+  }
+  cnd.V2
+}
+
+det.mult.F <- function(cnds, trns, iter.mthd, matrix.max, iter.max, trno, int.rng) {
+  # Loops through each candidate vector, removing already matched trnsns and running
+  #   check.fv.F to detect repos in them. Returns list length 2. 1st element is list of
+  #   numeric vectors containing detected repos; 2nd is stats on candidate vector.
+  #
+  # Function arguments:
+  # - cnds: list of (integer) candidate vectors. In each vector, first element is focus
+  #     trnsn and opposite dirn trnsns are negative. Ordered temporally from focus trnsn 
+  # - trns: transactions dataframe the same format as example dataset
+  # - iter.mthd: boolean scalar. Use the iterative method for long candidate vectors?
+  # - matrix.max: positive integer. Maximum candidate-vector length for matrix method
+  # - iter.max: integer > matrix.max. Max candidate-vector length for iterative method
+  # - trno: integer scalar. Temporary maximum number of transactions.
+  # - int.rng: 2-element numeric vector. interest.bounds expressed as daily rates.
+  
+  N <- length(cnds)
+  y <- c(0, vector('list', N))  # Initialise list for results. The 0 is removed later.
+  stats <- vector('list', N)  # Object for candidate vector stats
+  if(length(cnds) == 0) return(list())  # If nothing found, exit the function
+  for(j in N:1) {  # Loop through each candidate vector
+    if(cnds[[j]][1] %in% abs(unlist(y))) next  # Skip if focus trnsn already matched
+    cnds[[j]] <- cnds[[j]][!abs(cnds[[j]]) %in% abs(unlist(y))]  # Remove matched trnsns
+    cnds[[j]] <- reduce.cnd.vector.F(cnds[[j]], trns)  # Trim vector again
+    if(length(unique(floor(trns$ST[abs(cnds[[j]])]))) == 1) next  # Skip if all intraday
+    stats[[j]] <- c(length(cnds[[j]]) - 1, 0)  # Record the candidate vector length
+    if(stats[[j]][1] < 2) next  # Skip if candidate vector not longer than 2
+    y[[j+1]] <- check.fv.F(cnds[[j]], trns, iter.mthd, matrix.max, iter.max, trno, 
+                           int.rng)  # Run the next repo detection function
+    stats[[j]][2] <- y[[j+1]][[2]]  # Record whether a repo was detected    
+    if(stats[[j]][2] != 0) y[[j+1]] <- y[[j+1]][[1]] else y[[j+1]] <- NULL  # Store repos
+  }
+  list(y[-1], stats)  # The [-1] removes the zero appended before the loop
+}
+
+check.fv.F <- function(cndj, trns, iter.mthd, matrix.max, iter.max, trno, int.rng) {
+  # Takes a candidate vector, applies the matrix multiplcation method, then calls
+  #   check.int.F to check interest rates of potential combns. If no repo detected, 
+  #   applies iterative method using iterative.F then calls check.int.F again. Returns
+  #   list length 2. 1st element is vector of detected repo (or just focus trnsn if no
+  #   detn). 2nd element is scalar: 1 if matrix detn, -1 if iterative detn, 0 if none.
+  #
+  # Function arguments:
+  # - cndj: numeric vector containing candidate vector, i.e. an element of cnds.
+  # - trns: transactions dataframe the same format as example dataset
+  # - iter.mthd: boolean scalar. Use the iterative method for long candidate vectors?
+  # - matrix.max: positive integer. Maximum candidate-vector length for matrix method
+  # - iter.max: integer > matrix.max. Max candidate-vector length for iterative method
+  # - trno: integer scalar. Temporary maximum number of transactions.
+  # - int.rng: 2-element numeric vector. interest.bounds expressed as daily rates.
+
+  dtct <- 0  # Datum storing whether repo is detected and how
+  # Function for removing intraday cmbns. Creates bi.M matrix but 1 elements replaced
+  #   with that trnsn's nights since focus trnsn. So intraday cmbn rows only have zeros
+  pm.F <- function(bi.M, cn.SDs) rbind(t(t(bi.M)*c(cn.SDs[-1] - cn.SDs[1])))
+  # If the vector is longer than matrix.max, try only the first matrix.max trnsns
+  if(length(cndj) - 1 > matrix.max) cj2 <- cndj[1:(matrix.max + 1)] else cj2 <- cndj
+  if(matrix.max > 1) {  # Skip if matrix.max=1; i.e. if matrix method turned off.
+    cn.FVs <- trns$FV[abs(cj2[-1])] * -sign(cj2[-1])  # Correctly signed FVs
+    cn.SDs <- floor(trns$ST[abs(cj2)])  # Settlement days
+    # Matrix of {0,1}, columns are cj2 elements, rows are different combns
+    bi.M <- as.matrix(expand.grid(rep(list(0:1), length(cj2) - 1)))
+    bi.M <- rbind(bi.M[rowSums(bi.M) <= trno, ])  # Remove rows exceeding trnsn cap
+    # Next line removes rows not satisfying the matrix multiplication method.
+    bi.M <- rbind(bi.M[bi.M %*% cn.FVs == trns$FV[cj2[1]], ])
+    if(ncol(bi.M) == length(cj2[-1])) if(nrow(bi.M) > 0) bi.M <- 
+      rbind(bi.M[rowSums(pm.F(bi.M, cn.SDs)) != 0, ])  # Removes intraday combns
+    # If cmbns remain, check implied interest and store repo if detected.
+    if(length(bi.M) <= 0 | sum(bi.M) <= 0) y.e <- rbind(cj2[1]) else {
+      y.e <- check.int.F(cj2, bi.M, trns, int.rng)  # Save detected repos
+      if(length(y.e) > 1) dtct <- 1  # Record of whether cnddt vector gave detected repo 
+    }
+  } else y.e <- cndj[1]
+  # If shortening the vector did not produce anything, use the iterative method
+  if(length(cj2) < length(cndj) & iter.mthd & length(y.e) < 2) {
+    bi.M <- iterative.F(cndj, trns, iter.max, trno)  # Creates bi.M with iterative method
+    if(length(bi.M) <= 0 | sum(bi.M) <= 0) y.e <- rbind(cndj[1]) else {
+      # Remove itnraday combns
+      bi.M <- rbind(bi.M[rowSums(pm.F(bi.M, floor(trns$ST[abs(cndj)]))) != 0, ])
+      if(length(bi.M) <= 0 | sum(bi.M) <= 0) y.e <- rbind(cndj[1]) else {
+        y.e <- check.int.F(cndj, bi.M, trns, int.rng)  # Check interest and store
+        if(length(y.e) > 1) dtct <- -1  # Record of detections using iterative method
+      }
+    }      
+  }
+  list(y.e, dtct)
+}
+
+check.int.F <- function(cndj, bi.M, trns, int.rng) {
+  # Takes a candidate vector (cndj) and its potential combinations (bi.M), and detects 
+  #   and stores combns that satisfy the interest bounds. If multiple detns, stores
+  #   only those with shortest maturity. Returns numeric vector of detected repo (or 
+  #   just focus trnsn if no detn).
+  #
+  # Function arguments:
+  # - cndj: numeric vector containing focus trnsn then candidate vector, in same format 
+  #     as prs elements. Reverse dirn trnsns are negative.
+  # - bi.M: matrix of 0s and 1s. One column per elemtn of cndj excluding focus trnsn. 
+  #     Each row is a combn of trnsns that potentially form a detected repo.
+  # - trns: transactions dataframe the same format as example dataset
+  # - int.rng: 2-element numeric vector. interest.bounds expressed as daily rates.
+  
+  r <- nrow(bi.M)  # Store number of rows. 
+  bi.M2 <- cbind(rep(1, r), bi.M)  # Pre-add column of 1s to bi.M
+  cnsj <- trns$Cons[abs(cndj)] * sign(cndj)  # Vector of cash loans (+) and rpyments (-)
+  mts <- floor(as.numeric(trns$ST[abs(cndj)]))  # Store settlement days
+  mts <- mts - min(mts)  # Change them to nights since focus trnsn
+  # Form matrix of 2 rows, cols correspond to cnsj. Multplying cnsj by top row gives 
+  #   present values of trnsns using top of interest bounds. By bottom row - using bottom
+  #   of int bounds. Next, cnsj will be multiplied by bi.M2 to give cash movements in
+  #   each potential combination, and then manipulated to be multipled by int.mts.
+  int.mts <- outer(int.rng, -mts, function(int, mat) (int - 1)*mat + 1)
+  # Repeat int.mts r times so it can be applied to each row of bi.M2
+  int.mts2 <- matrix(rep(t(int.mts), r), nrow=2*r, byrow=TRUE)
+  cnsds <-  t(cnsj * t(bi.M2))  # Multiply cnsj (recycled r times) by bi.M2
+  cnsds2 <- cnsds[rep(1:r, rep(2, r)), ]  # Repeat each row of cnsds twice
+  # Form matrix of 2 rows, cols correspond to cmbns (rows) in bi.M. Top row gives total
+  #   NPV of combn using top of interest bounds. Bottom row using bottom of interest 
+  #   bounds. If zero is between them, the combn satisfies interest bounds.
+  bnds <- matrix(rowSums(int.mts2*cnsds2), nrow=2)
+  fsbl <- bnds[1, ] <= 0 & bnds[2, ] >= 0  # Columns of bnds that satisfy interst bounds
+  if(sum(fsbl) >= 2) {  # If multiple combns remain, keep only shortest maturity
+    row.mat <- apply(t(t(bi.M)*mts[-1]), 1, max)
+    fsbl <- row.mat == min(row.mat[fsbl]) & fsbl &
+      !duplicated(fsbl & row.mat == min(row.mat[fsbl]))  # If multiple, keep only first
+  }
+  if(sum(fsbl) >= 1) {  # If a repo detected, store it
+    y <- c(cndj[1], bi.M[fsbl, ] * cndj[-1])
+    y <- y[y != 0]
+  } else y <- cndj[1]
+  y
+}
+
+iterative.F <- function(cndj, trns, iter.max, trno) {
+  # Trims candidate vectors down to iter.max and applies the iterative method to find
+  #   trnsn combns with correctly summing FVs. Returns a matrix (bi.M) of 0s and 1s with
+  #   a column for each cndj element (ecluding focus trnsn) and rows representing cmbns.
+  #
+  # Function arguments:
+  # - cndj: numeric vector containing candidate vector, i.e. an element of prs.
+  # - trns: transactions dataframe the same format as example dataset
+  # - iter.max: integer > matrix.max. Max candidate-vector length for iterative method
+  # - trno: integer scalar. Temporary maximum number of transactions.
+
+  if(length(cndj) > iter.max) {
+    excs <- length(cndj) - iter.max  # Count how many trnsns to be trimmed out
+    cndj <- cndj[1:iter.max]  # Trim cndj down to iter.max
+  } else excs <- 0
+  tot <- trns$FV[cndj[1]]  # Store the focus trnsn FV
+  FVs <- trns$FV[abs(cndj[-1])] * -sign(cndj[-1])  # Store the cnddt trnsn FVs
+  m <- length(FVs)
+  # Next line iterates through each trnsn number (n) up to trno, creating a matrix whose
+  #   cols contain every combination of n FV elements, calculating the sum of each col,
+  #   then checking it against the focus trnsn FV.
+  # Replace '1:trno' with 'trno' (also in next lapply call) to only check trno combns.
+  s.sums <- unlist(lapply(1:trno, function(n) colSums(combn(FVs, min(m, n)))),
+                   use.names=FALSE) == tot  # Boolean vector indicating correct sums
+  bi.M <- matrix(0, nrow=sum(s.sums), ncol=m)  # An empty matrix to make bi.M out of
+  # Now identify the cndj elements in the correctly summing cmbns. 
+  fn <- function(n) {
+    y <- combn(1:m, min(m, n))  # All combns of 1,...,m of length n
+    split(y, rep(1:ncol(y), each=nrow(y)))  # Transform columns into list elements
+  }
+  # For each match take the position and put corresponding 1s into bi.M
+  if(sum(s.sums) > 0) {
+    # Generate list of all cmbns checked above in the s.sums line
+    psns <- unlist(lapply(1:trno, fn), recursive=FALSE, use.names=FALSE)
+    # Place 1s in bi.M corresponding to the correctly summing cmbns
+    for(n in 1:sum(s.sums)) bi.M[n, psns[s.sums][[n]]] <- 1
+  }
+  # Add columns of zeros for any trnsns trimmed out earlier
+  cbind(bi.M, matrix(0, nrow=nrow(bi.M), ncol=excs))
+}
+
